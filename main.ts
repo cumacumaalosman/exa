@@ -1,4 +1,4 @@
-const TARGET_HOST = 'https://ecsc-expat.sy:8443'
+const TARGET_HOST = 'https://bold-credit-0176.cumaalosman.workers.dev/'
 
 Deno.serve(async (request: Request): Promise<Response> => {
   const origUrl = new URL(request.url)

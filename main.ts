@@ -1,37 +1,47 @@
-// server.ts — Deno Deploy entrypoint
-// Root (/) and any path NOT /app,/login,/rs/add,/health will be proxied to TARGET_HOST
-// /app serves the UI. /login and /rs/add are handled by server logic as before.
-
+// server.ts — Deno Deploy entrypoint (CORS + cookie handling)
 const TARGET_HOST = "https://ecsc-expat.sy:8443";
 const DEFAULT_FETCH_TIMEOUT = 8000; // ms
 
-function jsonResponse(obj: unknown, status = 200, extraHeaders?: Record<string,string>) {
+function getRequestOrigin(req: Request) {
+  return req.headers.get("origin") || req.headers.get("referer") || null;
+}
+
+function makeCorsHeaders(req: Request, extra?: Record<string,string>) {
+  const origin = getRequestOrigin(req) || "*";
+  const headers: Record<string,string> = {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS,PUT,DELETE",
+    "Access-Control-Allow-Headers": "Content-Type, Source, Cookie, Authorization",
+    // allow client to send credentials
+    "Access-Control-Allow-Credentials": "true",
+    // expose some useful headers if needed
+    "Access-Control-Expose-Headers": "Location,Content-Length"
+  };
+  if (extra) Object.assign(headers, extra);
+  return headers;
+}
+
+function jsonResponse(req: Request, obj: unknown, status = 200, extraHeaders?: Record<string,string>) {
   const headers = new Headers({
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    ...extraHeaders
+    ...makeCorsHeaders(req, extraHeaders)
   });
   return new Response(JSON.stringify(obj), { status, headers });
 }
 
-function textResponse(text: string, status = 200, extraHeaders?: Record<string,string>) {
+function textResponse(req: Request, text: string, status = 200, extraHeaders?: Record<string,string>) {
   const headers = new Headers({
     "Content-Type": "text/html; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    ...extraHeaders
+    ...makeCorsHeaders(req, extraHeaders)
   });
   return new Response(text, { status, headers });
 }
 
-function corsPreflightResponse() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS,PUT,DELETE",
-      "Access-Control-Allow-Headers": "Content-Type, Source, Cookie, Authorization"
-    }
-  });
+function corsPreflightResponse(req: Request) {
+  const headers = new Headers(makeCorsHeaders(req));
+  // Preflight specific
+  headers.set("Content-Type", "text/plain; charset=utf-8");
+  return new Response(null, { status: 204, headers });
 }
 
 async function timeoutFetch(input: RequestInfo, init?: RequestInit, timeout = DEFAULT_FETCH_TIMEOUT) {
@@ -46,19 +56,20 @@ async function timeoutFetch(input: RequestInfo, init?: RequestInit, timeout = DE
   }
 }
 
-/** Proxy helper: forward request to targetUrl and return transformed response.
- *  - For HTML responses, rewrite absolute TARGET_HOST occurrences so they load under our domain.
- *  - Forward headers (including Set-Cookie). Rewrite Location header if present.
- */
+// Remove Domain=... from Set-Cookie so it becomes host-only for our domain
+function rewriteSetCookieForOurDomain(setCookieValue: string) {
+  // remove Domain=... (case-insensitive)
+  return setCookieValue.replace(/;\s*Domain=[^;]+/i, "");
+}
+
+/** Proxy helper: forward request to targetUrl and return response with CORS + rewritten Set-Cookie */
 async function proxyToTarget(req: Request, targetUrl: string): Promise<Response> {
-  // Build forward headers (copy request headers except some)
+  // Build forward headers (copy request headers except hop-by-hop)
   const forward = new Headers();
   req.headers.forEach((v, k) => {
-    // skip hop-by-hop and encoding headers that may cause issues
     if (["host", "content-length", "accept-encoding", "connection"].includes(k.toLowerCase())) return;
     forward.set(k, v);
   });
-  // set origin/host-related headers to target host if needed
   forward.set("Referer", TARGET_HOST);
   forward.set("Origin", TARGET_HOST);
 
@@ -66,67 +77,62 @@ async function proxyToTarget(req: Request, targetUrl: string): Promise<Response>
     method: req.method,
     headers: forward,
     redirect: "manual",
-    // stream body if present and method allows
     body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body
   };
 
   const upstream = await timeoutFetch(targetUrl, init);
-
   if (!upstream) {
-    return jsonResponse({ ok: false, error: "Upstream fetch failed or timed out" }, 502);
+    return jsonResponse(req, { ok: false, error: "Upstream fetch failed or timed out" }, 502);
   }
 
-  // copy upstream headers
-  const outHeaders = new Headers();
+  // build outgoing headers; include CORS headers matching incoming origin
+  const outHeaders = new Headers(makeCorsHeaders(req));
+  // Copy/transform upstream headers
   upstream.headers.forEach((v, k) => {
-    // We'll rewrite Location if needed later; keep Set-Cookie and others
-    outHeaders.append(k, v);
+    const lk = k.toLowerCase();
+    if (lk === "set-cookie") {
+      // rewrite and append each Set-Cookie value (ensure host-only)
+      // Note: upstream.headers.forEach will call for each header value already.
+      const rewritten = rewriteSetCookieForOurDomain(v);
+      outHeaders.append("set-cookie", rewritten);
+    } else if (lk === "location") {
+      // rewrite absolute Location pointing to TARGET_HOST to relative path so client stays under our domain
+      try {
+        const locUrl = new URL(v, TARGET_HOST);
+        if (locUrl.origin === (new URL(TARGET_HOST)).origin) {
+          const rel = locUrl.pathname + locUrl.search + locUrl.hash;
+          outHeaders.set("location", rel);
+        } else {
+          outHeaders.set(k, v);
+        }
+      } catch (_) {
+        outHeaders.set(k, v);
+      }
+    } else if (lk === "content-type") {
+      outHeaders.set("content-type", v);
+    } else {
+      // append other headers (preserve multiple values)
+      outHeaders.append(k, v);
+    }
   });
 
-  // If upstream sent a Location header pointing at TARGET_HOST, rewrite it to our domain (preserve path)
-  const loc = upstream.headers.get("location");
-  if (loc) {
-    try {
-      const locUrl = new URL(loc, TARGET_HOST);
-      if (locUrl.origin === (new URL(TARGET_HOST)).origin) {
-        // make it relative so browser requests our domain and we proxy again
-        const rel = locUrl.pathname + locUrl.search + locUrl.hash;
-        outHeaders.set("location", rel);
-      }
-    } catch (_) {
-      // ignore parse errors
-    }
-  }
-
-  // Ensure we allow our origin in response
-  outHeaders.set("Access-Control-Allow-Origin", "*");
-
-  // handle response body
   const contentType = upstream.headers.get("content-type") || "";
   if (contentType.includes("text/html")) {
-    // rewrite HTML so that absolute references to TARGET_HOST point to our domain (become relative)
     const text = await upstream.text();
-    // replace absolute target host occurrences (with and without port) to relative paths
+    // rewrite absolute references to TARGET_HOST -> relative (basic approach)
     const escaped = TARGET_HOST.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
     const re1 = new RegExp(escaped, "g");
-    const rewrite = text.replace(re1, "");
-    // also replace protocol-relative //ecsc-expat.sy:8443 or //ecsc-expat.sy
-    const hostOnly = (new URL(TARGET_HOST)).host;
-    const re2 = new RegExp("//" + hostOnly.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&"), "g");
-    const rewrite2 = rewrite.replace(re2, "");
-    // Some pages may reference the full origin https://ecsc-expat.sy (without port)
+    let final = text.replace(re1, "");
+    // also replace origin occurrences
     const hostOrigin = (new URL(TARGET_HOST)).origin;
-    const re3 = new RegExp(hostOrigin.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&"), "g");
-    const final = rewrite2.replace(re3, "");
+    const re2 = new RegExp(hostOrigin.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&"), "g");
+    final = final.replace(re2, "");
 
-    // optionally inject a small script to rewrite subsequent JS-based navigations (helps in some cases)
     const injection = `
 <script>
-  // Ensure future absolute navigations to the target origin use relative paths (simple guard)
   (function(){
     try {
       const target = ${JSON.stringify(new URL(TARGET_HOST).origin)};
-      // intercept location.assign / replace
       const _assign = location.assign;
       location.assign = function(u){ if(typeof u==='string' && u.indexOf(target)===0) u = u.replace(target,''); _assign.call(location,u); };
       const _replace = location.replace;
@@ -135,20 +141,14 @@ async function proxyToTarget(req: Request, targetUrl: string): Promise<Response>
   })();
 </script>
 `;
-    // insert injection before </head> if present, otherwise before </body>, otherwise prepend
-    let outHtml = final;
-    if (outHtml.includes("</head>")) outHtml = outHtml.replace("</head>", injection + "</head>");
-    else if (outHtml.includes("</body>")) outHtml = outHtml.replace("</body>", injection + "</body>");
-    else outHtml = injection + outHtml;
+    if (final.includes("</head>")) final = final.replace("</head>", injection + "</head>");
+    else if (final.includes("</body>")) final = final.replace("</body>", injection + "</body>");
+    else final = injection + final;
 
     outHeaders.set("content-type", "text/html; charset=utf-8");
-    // return rewritten HTML
-    return new Response(outHtml, { status: upstream.status, headers: outHeaders });
+    return new Response(final, { status: upstream.status, headers: outHeaders });
   } else {
-    // non-HTML: stream raw body (image, css, js, json, etc.)
     const buf = await upstream.arrayBuffer();
-    // preserve content-type if present
-    if (contentType) outHeaders.set("content-type", contentType);
     return new Response(buf, { status: upstream.status, headers: outHeaders });
   }
 }
@@ -158,26 +158,26 @@ async function handler(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const pathname = url.pathname || "/";
 
-    // health / warmup endpoint (fast response for deploy warm-up)
+    // Preflight
+    if (req.method === "OPTIONS") {
+      return corsPreflightResponse(req);
+    }
+
+    // Health
     if (req.method === "GET" && pathname === "/health") {
-      return jsonResponse({ ok: true, now: new Date().toISOString() }, 200);
+      return jsonResponse(req, { ok: true, now: new Date().toISOString() }, 200);
     }
 
     // Serve UI at /app
     if (req.method === "GET" && pathname === "/app") {
-      return textResponse(getHTML(), 200, { "Content-Type": "text/html; charset=utf-8" });
+      return textResponse(req, getHTML(), 200);
     }
 
-    // CORS preflight
-    if (req.method === "OPTIONS") {
-      return corsPreflightResponse();
-    }
-
-    // Login proxy: returns cookies string in JSON (handled by server as before)
+    // Login: proxy to target login and forward Set-Cookie headers (rewritten) to client
     if (req.method === "POST" && pathname === "/login") {
       try {
         const body = await req.json();
-        const resp = await timeoutFetch(`${TARGET_HOST}/secure/auth/login`, {
+        const upstream = await timeoutFetch(`${TARGET_HOST}/secure/auth/login`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -188,24 +188,46 @@ async function handler(req: Request): Promise<Response> {
           redirect: "manual"
         }, DEFAULT_FETCH_TIMEOUT);
 
-        const setCookie = resp?.headers.get("set-cookie") || "";
-        const text = await resp.text().catch(()=>"");
+        if (!upstream) return jsonResponse(req, { ok: false, error: "Upstream timeout" }, 504);
 
-        return jsonResponse({
-          ok: resp?.ok ?? false,
-          upstreamStatus: resp?.status ?? 0,
-          cookies: setCookie,
-          message: typeof text === "string" ? text : ""
+        // Build response headers with CORS + forwarded Set-Cookie(s)
+        const resHeaders = new Headers(makeCorsHeaders(req));
+        upstream.headers.forEach((v, k) => {
+          if (k.toLowerCase() === "set-cookie") {
+            resHeaders.append("set-cookie", rewriteSetCookieForOurDomain(v));
+          } else if (k.toLowerCase() === "location") {
+            // rewrite location if needed
+            try {
+              const locUrl = new URL(v, TARGET_HOST);
+              if (locUrl.origin === (new URL(TARGET_HOST)).origin) {
+                const rel = locUrl.pathname + locUrl.search + locUrl.hash;
+                resHeaders.set("location", rel);
+              } else {
+                resHeaders.set("location", v);
+              }
+            } catch (_) {
+              resHeaders.set("location", v);
+            }
+          } else if (k.toLowerCase() === "content-type") {
+            resHeaders.set("content-type", v);
+          }
         });
+
+        const text = await upstream.text().catch(()=>"");
+        const bodyObj = {
+          ok: upstream.ok,
+          upstreamStatus: upstream.status,
+          message: text || ""
+        };
+
+        return new Response(JSON.stringify(bodyObj), { status: 200, headers: resHeaders });
       } catch (err) {
-        const msg = (err instanceof Error && err.name === "AbortError")
-          ? "Upstream request timed out"
-          : err instanceof Error ? err.message : String(err);
-        return jsonResponse({ ok: false, error: msg }, 500);
+        const msg = (err instanceof Error && err.name === "AbortError") ? "Upstream timed out" : (err instanceof Error ? err.message : String(err));
+        return jsonResponse(req, { ok: false, error: msg }, 500);
       }
     }
 
-    // Add appointment proxy: forwards browser cookies to target
+    // Add appointment: forward cookies from browser (they will be sent automatically if credentials: 'include')
     if (req.method === "POST" && pathname === "/rs/add") {
       try {
         const body = await req.json();
@@ -229,6 +251,16 @@ async function handler(req: Request): Promise<Response> {
           redirect: "manual"
         }, DEFAULT_FETCH_TIMEOUT);
 
+        if (!upstream) return jsonResponse(req, { ok: false, error: "Upstream timeout" }, 504);
+
+        // Forward any Set-Cookie headers from upstream so browser stores them under our domain
+        const resHeaders = new Headers(makeCorsHeaders(req));
+        upstream.headers.forEach((v, k) => {
+          if (k.toLowerCase() === "set-cookie") {
+            resHeaders.append("set-cookie", rewriteSetCookieForOurDomain(v));
+          }
+        });
+
         const len = parseInt(upstream.headers.get("content-length") || "0", 10);
         let message = "";
         if (upstream.status === 400 && len === 220) message = "تم حجز كافة المواعيد المخصصة لهذه الخدمة.. يرجى اختيار يوم آخر";
@@ -238,36 +270,35 @@ async function handler(req: Request): Promise<Response> {
         else if (upstream.status === 200) message = "تم التثبيت بنجاح";
         else message = "استجابة غير متوقعة من الخادم";
 
-        return jsonResponse({
+        const bodyObj = {
           ok: upstream.ok,
           upstreamStatus: upstream.status,
           message
-        });
+        };
+
+        return new Response(JSON.stringify(bodyObj), { status: 200, headers: resHeaders });
       } catch (err) {
-        const msg = (err instanceof Error && err.name === "AbortError")
-          ? "Upstream request timed out"
-          : err instanceof Error ? err.message : String(err);
-        return jsonResponse({ ok: false, error: msg }, 500);
+        const msg = (err instanceof Error && err.name === "AbortError") ? "Upstream timed out" : (err instanceof Error ? err.message : String(err));
+        return jsonResponse(req, { ok: false, error: msg }, 500);
       }
     }
 
-    // If path is not one of the above, proxy it to TARGET_HOST so verification and its assets load under our domain
-    // This includes GET / which will show the verification page under our domain.
-    // Build target URL preserving path and query
+    // fallback: proxy everything else to TARGET_HOST (this includes GET / which will show captcha under your domain)
     const targetUrl = TARGET_HOST.replace(/\/+$/, "") + pathname + url.search;
     return await proxyToTarget(req, targetUrl);
 
   } catch (err) {
-    return jsonResponse({ ok: false, error: (err instanceof Error ? err.message : String(err)) }, 500);
+    return jsonResponse(req, { ok: false, error: (err instanceof Error ? err.message : String(err)) }, 500);
   }
 }
 
-// Start server
+// Start server (Deno.serve); Deno Deploy will bind automatically
 const port = Number(Deno.env.get("PORT") || 8000);
 console.log(`Starting server (Deno) — port ${port} — TARGET_HOST=${TARGET_HOST}`);
 Deno.serve({ port }, handler);
 
 // ---------------------- client HTML (runs in browser) ----------------------
+// Note: client fetches now use credentials: 'include' so cookies are stored and sent automatically.
 function getHTML(): string {
   return `<!doctype html>
 <html lang="ar" dir="rtl">
@@ -276,40 +307,20 @@ function getHTML(): string {
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Jumaa — نظام الحجوزات</title>
 <style>
-  :root{
-    --bg:#f4f7fb; --card:#ffffff; --accent:#0753a6; --accent2:#2ea6ff; --ok:#2e7d32; --err:#c62828;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font-family:Inter, "Segoe UI", Tahoma, Arial; background:var(--bg); color:#111; direction:rtl}
+  :root{--bg:#f4f7fb;--card:#fff;--accent:#0753a6;--accent2:#2ea6ff}
+  *{box-sizing:border-box} body{margin:0;font-family:Inter,Arial;direction:rtl;background:var(--bg)}
   .page{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px}
   .card{width:520px;max-width:95vw;background:var(--card);border-radius:14px;padding:22px;box-shadow:0 20px 50px rgba(20,30,60,0.12)}
-  h1{margin:0 0 6px;color:var(--accent);text-align:center;font-size:22px}
-  .sub{font-size:12px;color:#667;text-align:center;margin-bottom:14px}
+  h1{margin:0 0 6px;color:var(--accent);text-align:center;font-size:22px} .sub{font-size:12px;color:#667;text-align:center;margin-bottom:14px}
   label{display:block;margin-top:10px;font-weight:600;font-size:13px}
-  input[type="text"], input[type="password"], input[type="date"], input[type="number"], select{
-    width:100%;padding:10px;border-radius:10px;border:1px solid #e6eef7;margin-top:6px;font-size:14px;background:#fbfdff;
-  }
-  .row{display:flex;gap:12px;align-items:center}
+  input,select{width:100%;padding:10px;border-radius:10px;border:1px solid #e6eef7;margin-top:6px;background:#fbfdff}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .btn{display:inline-block;padding:10px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
+  .btn{padding:10px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
   .btn-primary{background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff}
-  .btn-ghost{background:transparent;border:1px solid #e6eef7;color:var(--accent);border-radius:10px;padding:9px 12px}
-  .controls{margin-top:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
-  #messages{margin-top:14px;height:140px;overflow:auto;padding-right:6px;border-radius:10px;background:#fbfdff;border:1px solid #eef5ff;padding:10px}
-  .msg{padding:10px 12px;border-radius:10px;margin-bottom:8px;color:#fff;box-shadow:0 8px 20px rgba(10,20,40,0.06);opacity:0;transform:translateY(12px);transition:all .36s cubic-bezier(.2,.9,.2,1)}
-  .msg.show{transform:translateY(0);opacity:1}
-  .msg.ok{background:linear-gradient(90deg,#2e7d32,#66bb6a)}
-  .msg.err{background:linear-gradient(90deg,#c62828,#ff6f61)}
-  .status{font-size:13px;color:#444}
-  .footer{font-size:12px;color:#667;text-align:center;margin-top:12px}
-  @keyframes spin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
-  }
-  @media (max-width: 600px) {
-    .two{grid-template-columns:1fr}
-    .card{padding:16px}
-  }
+  .btn-ghost{background:transparent;border:1px solid #e6eef7;color:var(--accent);padding:9px 12px;border-radius:10px}
+  #messages{margin-top:14px;height:140px;overflow:auto;padding:10px;border-radius:10px;background:#fbfdff;border:1px solid #eef5ff}
+  .msg{padding:10px;border-radius:10px;margin-bottom:8px;color:#fff}
+  .msg.ok{background:linear-gradient(90deg,#2e7d32,#66bb6a)} .msg.err{background:linear-gradient(90deg,#c62828,#ff6f61)}
 </style>
 </head>
 <body>
@@ -370,7 +381,7 @@ function getHTML(): string {
     <label>الفاصل (مللي ثانية)</label>
     <input id="interval" type="number" min="250" value="1000">
 
-    <div class="controls">
+    <div style="margin-top:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
       <button id="startBtn" class="btn btn-primary">بدء التثبيت التلقائي</button>
       <div style="display:flex;align-items:center;gap:10px">
         <button id="sendOnce" class="btn btn-ghost">إرسال مرة واحدة</button>
@@ -378,7 +389,7 @@ function getHTML(): string {
     </div>
 
     <div id="messages" aria-live="polite" aria-atomic="false"></div>
-    <div class="footer">جميع الحقوق محفوظة 2025</div>
+    <div class="footer" style="font-size:12px;color:#667;text-align:center;margin-top:12px">جميع الحقوق محفوظة 2025</div>
   </div>
 </div>
 
@@ -389,7 +400,6 @@ function getHTML(): string {
   const startBtn = document.getElementById('startBtn');
   const sendOnceBtn = document.getElementById('sendOnce');
   const messages = document.getElementById('messages');
-  const status = document.getElementById('status');
 
   let autoTimer = null;
   let pending = 0;
@@ -399,56 +409,40 @@ function getHTML(): string {
     d.className = 'msg ' + (ok ? 'ok' : 'err');
     d.textContent = text;
     messages.prepend(d);
-    requestAnimationFrame(() => d.classList.add('show'));
-    setTimeout(() => {
-      d.classList.remove('show');
-      setTimeout(() => { try { d.remove(); } catch(_){} }, 420);
-    }, duration);
-  }
-
-  function showSpinner(flag) {
-    status.innerHTML = flag ? '<span style="display:inline-block;width:18px;height:18px;border-radius:50%;border:3px solid rgba(0,0,0,0.08);border-top:3px solid var(--accent);animation:spin 1s linear infinite"></span>' : '';
+    setTimeout(() => { try { d.remove(); } catch(_){} }, duration);
   }
 
   clearBtn.addEventListener('click', () => {
-    const cookies = document.cookie.split(";").map(c => c.trim()).filter(Boolean);
-    cookies.forEach(c => {
-      const name = c.split('=')[0];
+    // delete cookies for this domain (best-effort)
+    document.cookie.split(";").forEach(c => {
+      const name = c.split("=")[0].trim();
       document.cookie = name + "=; Max-Age=0; path=/";
     });
     addMessage('تم مسح الكوكيز محليًا', false, 1800);
   });
 
+  // LOGIN: use credentials: 'include' so Set-Cookie sent by server is stored by browser
   loginBtn.addEventListener('click', async () => {
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
-    if (!username || !password) { addMessage('الرجاء إدخال البريد وكلمة المرور', false, 2200); return; }
+    if (!username || !password) { addMessage('الرجاء إدخال البريد وكلمة المرور', false); return; }
 
     try {
       pending++; showSpinner(true);
       const res = await fetch('/login', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
       const data = await res.json();
-      const cookies = data.cookies || data.cookie || '';
-      if (cookies) {
-        const parts = cookies.split(/\\r?\\n|,\\s*/).filter(Boolean);
-        parts.forEach(p => {
-          try {
-            const nv = p.split(';')[0].trim();
-            if (nv && nv.includes('=')) {
-              document.cookie = nv + '; path=/';
-            }
-          } catch(_) {}
-        });
-        addMessage('تم تسجيل الدخول وتثبيت الجلسة', true, 2200);
+      if (res.ok) {
+        addMessage(data.message || 'تم تسجيل الدخول', true);
       } else {
-        addMessage('تم تسجيل الدخول — لم يتم إرسال كوكيز من الخادم', false, 2200);
+        addMessage(data.error || data.message || 'فشل تسجيل الدخول', false);
       }
     } catch (err) {
-      addMessage('فشل تسجيل الدخول', false, 2200);
+      addMessage('فشل تسجيل الدخول', false);
     } finally {
       pending = Math.max(0, pending-1);
       if (pending === 0) showSpinner(false);
@@ -461,37 +455,43 @@ function getHTML(): string {
     const serviceId = parseInt(document.getElementById('service').value || '113', 10);
     const copies = parseInt(document.getElementById('copies').value || '1', 10);
 
-    if (!missionId) { addMessage('اختر مدينة صحيحة', false, 2000); return; }
+    if (!missionId) { addMessage('اختر مدينة صحيحة', false); return; }
 
     try {
       pending++; showSpinner(true);
       const resp = await fetch('/rs/add', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ missionId, serviceId, copies, date })
       });
       const data = await resp.json();
       const isOk = (typeof data.upstreamStatus !== 'undefined' ? (data.upstreamStatus === 200) : (data.ok === true));
-      addMessage(data.message || 'تم الإرسال', isOk, 2800);
+      addMessage(data.message || 'تم الإرسال', isOk);
     } catch (err) {
-      addMessage('فشل الاتصال بالخادم', false, 2800);
+      addMessage('فشل الاتصال بالخادم', false);
     } finally {
       pending = Math.max(0, pending-1);
       if (pending === 0) showSpinner(false);
     }
   }
 
+  function showSpinner(flag) {
+    const status = document.getElementById('status');
+    status.innerHTML = flag ? '<span style="display:inline-block;width:18px;height:18px;border-radius:50%;border:3px solid rgba(0,0,0,0.08);border-top:3px solid var(--accent);animation:spin 1s linear infinite"></span>' : '';
+  }
+
   startBtn.addEventListener('click', () => {
     if (autoTimer) {
       clearInterval(autoTimer); autoTimer = null;
       startBtn.textContent = 'بدء التثبيت التلقائي';
-      addMessage('تم إيقاف التثبيت التلقائي', false, 1800);
+      addMessage('تم إيقاف التثبيت التلقائي', false);
       return;
     }
     const interval = Math.max(250, parseInt(document.getElementById('interval').value || '1000', 10));
     autoTimer = setInterval(sendInstallOnce, interval);
     startBtn.textContent = 'إيقاف التثبيت';
-    addMessage('تم تشغيل التثبيت التلقائي كل ' + interval + ' مللي ثانية', true, 2000);
+    addMessage('تم تشغيل التثبيت التلقائي كل ' + interval + ' مللي ثانية', true);
   });
 
   sendOnceBtn.addEventListener('click', sendInstallOnce);

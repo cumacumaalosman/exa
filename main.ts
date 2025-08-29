@@ -1,4 +1,7 @@
 // server.ts — جاهز للنشر على Deno Deploy
+// سلوك جديد: فتح "/" سيحوّل المستخدم إلى TARGET_HOST لإجراء تحقق "أنا لست روبوت".
+// الواجهة الأصلية متاحة الآن على "/app".
+
 const TARGET_HOST = "https://ecsc-expat.sy:8443";
 const DEFAULT_FETCH_TIMEOUT = 8000; // ms
 
@@ -48,13 +51,19 @@ async function handler(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const pathname = url.pathname || "/";
 
+    // Redirect root to TARGET_HOST for performing the "أنا لست روبوت" verification
+    if (req.method === "GET" && (pathname === "/" || pathname === "")) {
+      // مؤقت 302 Redirect
+      return Response.redirect(TARGET_HOST, 302);
+    }
+
     // health / warmup endpoint (fast response for deploy warm-up)
     if (req.method === "GET" && pathname === "/health") {
       return jsonResponse({ ok: true, now: new Date().toISOString() }, 200);
     }
 
-    // Serve UI
-    if (req.method === "GET" && (pathname === "/" || pathname === "")) {
+    // Serve UI at /app (moved from root so root can redirect to TARGET_HOST)
+    if (req.method === "GET" && pathname === "/app") {
       return textResponse(getHTML(), 200, { "Content-Type": "text/html; charset=utf-8" });
     }
 
@@ -154,6 +163,7 @@ console.log(`Starting server (Deno) — port ${port} — TARGET_HOST=${TARGET_HO
 Deno.serve({ port }, handler);
 
 // ---------------------- client HTML (runs in browser) ----------------------
+// ملاحظة: الواجهة الآن عند "/app"
 function getHTML(): string {
   return `<!doctype html>
 <html lang="ar" dir="rtl">
@@ -308,7 +318,7 @@ function getHTML(): string {
     addMessage('تم مسح الكوكيز محليًا', false, 1800);
   });
 
-  // Login: call worker /login, extract Set-Cookie string and set document.cookie
+  // Login: call server /login, extract Set-Cookie string and set document.cookie
   loginBtn.addEventListener('click', async () => {
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;

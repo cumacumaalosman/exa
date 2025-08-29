@@ -1,6 +1,6 @@
-// server.ts — جاهز للنشر على Deno Deploy
-// سلوك جديد: فتح "/" سيحوّل المستخدم إلى TARGET_HOST لإجراء تحقق "أنا لست روبوت".
-// الواجهة الأصلية متاحة الآن على "/app".
+// server.ts — Deno Deploy entrypoint
+// Root (/) and any path NOT /app,/login,/rs/add,/health will be proxied to TARGET_HOST
+// /app serves the UI. /login and /rs/add are handled by server logic as before.
 
 const TARGET_HOST = "https://ecsc-expat.sy:8443";
 const DEFAULT_FETCH_TIMEOUT = 8000; // ms
@@ -28,8 +28,8 @@ function corsPreflightResponse() {
     status: 204,
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Source, Cookie"
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS,PUT,DELETE",
+      "Access-Control-Allow-Headers": "Content-Type, Source, Cookie, Authorization"
     }
   });
 }
@@ -46,23 +46,124 @@ async function timeoutFetch(input: RequestInfo, init?: RequestInit, timeout = DE
   }
 }
 
+/** Proxy helper: forward request to targetUrl and return transformed response.
+ *  - For HTML responses, rewrite absolute TARGET_HOST occurrences so they load under our domain.
+ *  - Forward headers (including Set-Cookie). Rewrite Location header if present.
+ */
+async function proxyToTarget(req: Request, targetUrl: string): Promise<Response> {
+  // Build forward headers (copy request headers except some)
+  const forward = new Headers();
+  req.headers.forEach((v, k) => {
+    // skip hop-by-hop and encoding headers that may cause issues
+    if (["host", "content-length", "accept-encoding", "connection"].includes(k.toLowerCase())) return;
+    forward.set(k, v);
+  });
+  // set origin/host-related headers to target host if needed
+  forward.set("Referer", TARGET_HOST);
+  forward.set("Origin", TARGET_HOST);
+
+  const init: RequestInit = {
+    method: req.method,
+    headers: forward,
+    redirect: "manual",
+    // stream body if present and method allows
+    body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body
+  };
+
+  const upstream = await timeoutFetch(targetUrl, init);
+
+  if (!upstream) {
+    return jsonResponse({ ok: false, error: "Upstream fetch failed or timed out" }, 502);
+  }
+
+  // copy upstream headers
+  const outHeaders = new Headers();
+  upstream.headers.forEach((v, k) => {
+    // We'll rewrite Location if needed later; keep Set-Cookie and others
+    outHeaders.append(k, v);
+  });
+
+  // If upstream sent a Location header pointing at TARGET_HOST, rewrite it to our domain (preserve path)
+  const loc = upstream.headers.get("location");
+  if (loc) {
+    try {
+      const locUrl = new URL(loc, TARGET_HOST);
+      if (locUrl.origin === (new URL(TARGET_HOST)).origin) {
+        // make it relative so browser requests our domain and we proxy again
+        const rel = locUrl.pathname + locUrl.search + locUrl.hash;
+        outHeaders.set("location", rel);
+      }
+    } catch (_) {
+      // ignore parse errors
+    }
+  }
+
+  // Ensure we allow our origin in response
+  outHeaders.set("Access-Control-Allow-Origin", "*");
+
+  // handle response body
+  const contentType = upstream.headers.get("content-type") || "";
+  if (contentType.includes("text/html")) {
+    // rewrite HTML so that absolute references to TARGET_HOST point to our domain (become relative)
+    const text = await upstream.text();
+    // replace absolute target host occurrences (with and without port) to relative paths
+    const escaped = TARGET_HOST.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const re1 = new RegExp(escaped, "g");
+    const rewrite = text.replace(re1, "");
+    // also replace protocol-relative //ecsc-expat.sy:8443 or //ecsc-expat.sy
+    const hostOnly = (new URL(TARGET_HOST)).host;
+    const re2 = new RegExp("//" + hostOnly.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&"), "g");
+    const rewrite2 = rewrite.replace(re2, "");
+    // Some pages may reference the full origin https://ecsc-expat.sy (without port)
+    const hostOrigin = (new URL(TARGET_HOST)).origin;
+    const re3 = new RegExp(hostOrigin.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&"), "g");
+    const final = rewrite2.replace(re3, "");
+
+    // optionally inject a small script to rewrite subsequent JS-based navigations (helps in some cases)
+    const injection = `
+<script>
+  // Ensure future absolute navigations to the target origin use relative paths (simple guard)
+  (function(){
+    try {
+      const target = ${JSON.stringify(new URL(TARGET_HOST).origin)};
+      // intercept location.assign / replace
+      const _assign = location.assign;
+      location.assign = function(u){ if(typeof u==='string' && u.indexOf(target)===0) u = u.replace(target,''); _assign.call(location,u); };
+      const _replace = location.replace;
+      location.replace = function(u){ if(typeof u==='string' && u.indexOf(target)===0) u = u.replace(target,''); _replace.call(location,u); };
+    }catch(e){}
+  })();
+</script>
+`;
+    // insert injection before </head> if present, otherwise before </body>, otherwise prepend
+    let outHtml = final;
+    if (outHtml.includes("</head>")) outHtml = outHtml.replace("</head>", injection + "</head>");
+    else if (outHtml.includes("</body>")) outHtml = outHtml.replace("</body>", injection + "</body>");
+    else outHtml = injection + outHtml;
+
+    outHeaders.set("content-type", "text/html; charset=utf-8");
+    // return rewritten HTML
+    return new Response(outHtml, { status: upstream.status, headers: outHeaders });
+  } else {
+    // non-HTML: stream raw body (image, css, js, json, etc.)
+    const buf = await upstream.arrayBuffer();
+    // preserve content-type if present
+    if (contentType) outHeaders.set("content-type", contentType);
+    return new Response(buf, { status: upstream.status, headers: outHeaders });
+  }
+}
+
 async function handler(req: Request): Promise<Response> {
   try {
     const url = new URL(req.url);
     const pathname = url.pathname || "/";
-
-    // Redirect root to TARGET_HOST for performing the "أنا لست روبوت" verification
-    if (req.method === "GET" && (pathname === "/" || pathname === "")) {
-      // مؤقت 302 Redirect
-      return Response.redirect(TARGET_HOST, 302);
-    }
 
     // health / warmup endpoint (fast response for deploy warm-up)
     if (req.method === "GET" && pathname === "/health") {
       return jsonResponse({ ok: true, now: new Date().toISOString() }, 200);
     }
 
-    // Serve UI at /app (moved from root so root can redirect to TARGET_HOST)
+    // Serve UI at /app
     if (req.method === "GET" && pathname === "/app") {
       return textResponse(getHTML(), 200, { "Content-Type": "text/html; charset=utf-8" });
     }
@@ -72,7 +173,7 @@ async function handler(req: Request): Promise<Response> {
       return corsPreflightResponse();
     }
 
-    // Login proxy: returns cookies string in JSON
+    // Login proxy: returns cookies string in JSON (handled by server as before)
     if (req.method === "POST" && pathname === "/login") {
       try {
         const body = await req.json();
@@ -150,20 +251,23 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    // unknown
-    return jsonResponse({ error: "مسار غير معروف" }, 404);
+    // If path is not one of the above, proxy it to TARGET_HOST so verification and its assets load under our domain
+    // This includes GET / which will show the verification page under our domain.
+    // Build target URL preserving path and query
+    const targetUrl = TARGET_HOST.replace(/\/+$/, "") + pathname + url.search;
+    return await proxyToTarget(req, targetUrl);
+
   } catch (err) {
     return jsonResponse({ ok: false, error: (err instanceof Error ? err.message : String(err)) }, 500);
   }
 }
 
-// Start server using Deno.serve — Deno Deploy ignores port param and binds automatically.
+// Start server
 const port = Number(Deno.env.get("PORT") || 8000);
 console.log(`Starting server (Deno) — port ${port} — TARGET_HOST=${TARGET_HOST}`);
 Deno.serve({ port }, handler);
 
 // ---------------------- client HTML (runs in browser) ----------------------
-// ملاحظة: الواجهة الآن عند "/app"
 function getHTML(): string {
   return `<!doctype html>
 <html lang="ar" dir="rtl">
@@ -295,9 +399,7 @@ function getHTML(): string {
     d.className = 'msg ' + (ok ? 'ok' : 'err');
     d.textContent = text;
     messages.prepend(d);
-    // animate in
     requestAnimationFrame(() => d.classList.add('show'));
-    // disappear after duration
     setTimeout(() => {
       d.classList.remove('show');
       setTimeout(() => { try { d.remove(); } catch(_){} }, 420);
@@ -308,7 +410,6 @@ function getHTML(): string {
     status.innerHTML = flag ? '<span style="display:inline-block;width:18px;height:18px;border-radius:50%;border:3px solid rgba(0,0,0,0.08);border-top:3px solid var(--accent);animation:spin 1s linear infinite"></span>' : '';
   }
 
-  // Clear document cookies for current origin (simple approach)
   clearBtn.addEventListener('click', () => {
     const cookies = document.cookie.split(";").map(c => c.trim()).filter(Boolean);
     cookies.forEach(c => {
@@ -318,7 +419,6 @@ function getHTML(): string {
     addMessage('تم مسح الكوكيز محليًا', false, 1800);
   });
 
-  // Login: call server /login, extract Set-Cookie string and set document.cookie
   loginBtn.addEventListener('click', async () => {
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
@@ -334,7 +434,6 @@ function getHTML(): string {
       const data = await res.json();
       const cookies = data.cookies || data.cookie || '';
       if (cookies) {
-        // split on newline or comma, keep tokens that contain '='
         const parts = cookies.split(/\\r?\\n|,\\s*/).filter(Boolean);
         parts.forEach(p => {
           try {
@@ -372,7 +471,6 @@ function getHTML(): string {
         body: JSON.stringify({ missionId, serviceId, copies, date })
       });
       const data = await resp.json();
-      // color by upstreamStatus
       const isOk = (typeof data.upstreamStatus !== 'undefined' ? (data.upstreamStatus === 200) : (data.ok === true));
       addMessage(data.message || 'تم الإرسال', isOk, 2800);
     } catch (err) {
@@ -383,7 +481,6 @@ function getHTML(): string {
     }
   }
 
-  // start/stop auto
   startBtn.addEventListener('click', () => {
     if (autoTimer) {
       clearInterval(autoTimer); autoTimer = null;
@@ -397,7 +494,6 @@ function getHTML(): string {
     addMessage('تم تشغيل التثبيت التلقائي كل ' + interval + ' مللي ثانية', true, 2000);
   });
 
-  // manual send once
   sendOnceBtn.addEventListener('click', sendInstallOnce);
 
 })();

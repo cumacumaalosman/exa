@@ -1,7 +1,6 @@
-// server.ts
-import { serve } from "https://deno.land/std@0.201.0/http/server.ts";
-
+// server.ts — جاهز للنشر على Deno Deploy
 const TARGET_HOST = "https://ecsc-expat.sy:8443";
+const DEFAULT_FETCH_TIMEOUT = 8000; // ms
 
 function jsonResponse(obj: unknown, status = 200, extraHeaders?: Record<string,string>) {
   const headers = new Headers({
@@ -32,10 +31,27 @@ function corsPreflightResponse() {
   });
 }
 
+async function timeoutFetch(input: RequestInfo, init?: RequestInit, timeout = DEFAULT_FETCH_TIMEOUT) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const signal = controller.signal;
+    const res = await fetch(input, { ...(init || {}), signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 async function handler(req: Request): Promise<Response> {
   try {
     const url = new URL(req.url);
     const pathname = url.pathname || "/";
+
+    // health / warmup endpoint (fast response for deploy warm-up)
+    if (req.method === "GET" && pathname === "/health") {
+      return jsonResponse({ ok: true, now: new Date().toISOString() }, 200);
+    }
 
     // Serve UI
     if (req.method === "GET" && (pathname === "/" || pathname === "")) {
@@ -51,7 +67,7 @@ async function handler(req: Request): Promise<Response> {
     if (req.method === "POST" && pathname === "/login") {
       try {
         const body = await req.json();
-        const resp = await fetch(`${TARGET_HOST}/secure/auth/login`, {
+        const resp = await timeoutFetch(`${TARGET_HOST}/secure/auth/login`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -60,19 +76,22 @@ async function handler(req: Request): Promise<Response> {
           },
           body: JSON.stringify({ username: body.username, password: body.password }),
           redirect: "manual"
-        });
+        }, DEFAULT_FETCH_TIMEOUT);
 
-        const setCookie = resp.headers.get("set-cookie") || "";
-        const text = await resp.text();
+        const setCookie = resp?.headers.get("set-cookie") || "";
+        const text = await resp.text().catch(()=>"");
 
         return jsonResponse({
-          ok: resp.ok,
-          upstreamStatus: resp.status,
+          ok: resp?.ok ?? false,
+          upstreamStatus: resp?.status ?? 0,
           cookies: setCookie,
           message: typeof text === "string" ? text : ""
         });
       } catch (err) {
-        return jsonResponse({ ok: false, error: (err as Error).message }, 500);
+        const msg = (err instanceof Error && err.name === "AbortError")
+          ? "Upstream request timed out"
+          : err instanceof Error ? err.message : String(err);
+        return jsonResponse({ ok: false, error: msg }, 500);
       }
     }
 
@@ -82,7 +101,7 @@ async function handler(req: Request): Promise<Response> {
         const body = await req.json();
         const cookieHeader = req.headers.get("cookie") || "";
 
-        const upstream = await fetch(`${TARGET_HOST}/rs/add`, {
+        const upstream = await timeoutFetch(`${TARGET_HOST}/rs/add`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -98,7 +117,7 @@ async function handler(req: Request): Promise<Response> {
             date: body.date === "" ? null : (body.date || null)
           }),
           redirect: "manual"
-        });
+        }, DEFAULT_FETCH_TIMEOUT);
 
         const len = parseInt(upstream.headers.get("content-length") || "0", 10);
         let message = "";
@@ -115,19 +134,24 @@ async function handler(req: Request): Promise<Response> {
           message
         });
       } catch (err) {
-        return jsonResponse({ ok: false, error: (err as Error).message }, 500);
+        const msg = (err instanceof Error && err.name === "AbortError")
+          ? "Upstream request timed out"
+          : err instanceof Error ? err.message : String(err);
+        return jsonResponse({ ok: false, error: msg }, 500);
       }
     }
 
     // unknown
     return jsonResponse({ error: "مسار غير معروف" }, 404);
   } catch (err) {
-    return jsonResponse({ ok: false, error: (err as Error).message }, 500);
+    return jsonResponse({ ok: false, error: (err instanceof Error ? err.message : String(err)) }, 500);
   }
 }
 
-// Start the server. On Deno Deploy this will bind automatically; locally it will listen on the default port.
-serve(handler);
+// Start server using Deno.serve — Deno Deploy ignores port param and binds automatically.
+const port = Number(Deno.env.get("PORT") || 8000);
+console.log(`Starting server (Deno) — port ${port} — TARGET_HOST=${TARGET_HOST}`);
+Deno.serve({ port }, handler);
 
 // ---------------------- client HTML (runs in browser) ----------------------
 function getHTML(): string {
@@ -284,7 +308,7 @@ function getHTML(): string {
     addMessage('تم مسح الكوكيز محليًا', false, 1800);
   });
 
-  // Login: call server /login, extract Set-Cookie string and set document.cookie
+  // Login: call worker /login, extract Set-Cookie string and set document.cookie
   loginBtn.addEventListener('click', async () => {
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;

@@ -1,7 +1,7 @@
 // server.ts
 // Deno Deploy entrypoint — proxy + cookie rewriting + forced Origin/Referer to target host
 
-const TARGET_HOST = "https://ecsc-expat.sy:8443"; // target (keep protocol+host+port)
+const TARGET_HOST = "https://ecsc-expat.sy"; // target (keep protocol+host+port)
 const DEFAULT_FETCH_TIMEOUT = 9000; // ms
 const TRY_HTTP_FALLBACK = true; // اجعل false إذا لا تريد تجربة http fallback
 
